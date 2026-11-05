@@ -376,6 +376,9 @@ Match Group sftponly
     ChrootDirectory %h
     ForceCommand internal-sftp -u 0007
     PasswordAuthentication yes
+    # clientes como o FileZilla oferecem todas as chaves do agente SSH antes da senha;
+    # com várias chaves, o limite global (4) esgota antes de tentar a senha
+    MaxAuthTries 10
     AllowTcpForwarding no
     AllowAgentForwarding no
     PermitTunnel no
