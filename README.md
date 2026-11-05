@@ -21,7 +21,7 @@ ssh root@IP 'bash /root/php-server-config/setup.sh'
 ```
 
 Pré-requisito: sua chave SSH já em `/root/.ssh/authorized_keys` (o login por senha do root é desativado).
-Pode rodar de novo quantas vezes quiser. Variáveis opcionais: `PHP_VERSIONS="8.4 8.3"`, `DEFAULT_PHP`, `TIMEZONE`, `SWAP_SIZE`.
+Pode rodar de novo quantas vezes quiser. Variáveis opcionais: `PHP_VERSIONS="8.4 8.3"`, `DEFAULT_PHP`, `TIMEZONE`, `SWAP_SIZE`, `LE_EMAIL`, `UPLOAD_MAX` (MB, padrão 1024).
 
 ## Uso do dia a dia
 
@@ -75,6 +75,19 @@ site info dominio.com.br                  # atualize wp-config.php / .env com o 
 ```
 
 Para Laravel com web root em `public/`, crie com `--laravel`. Cron do Laravel: `crontab -u <usuario_do_site> -e`.
+
+## Upload de arquivos grandes (ex: All-in-One WP Migration)
+
+O servidor aceita uploads de até **1 GB** (`upload_max_filesize`, `post_max_size` e `client_max_body_size`; altere com `UPLOAD_MAX` e rode o setup de novo).
+
+**Atenção: a Cloudflare (planos Free/Pro) recusa requisições acima de 100 MB** (erro 413), independentemente do servidor.
+Para enviar um arquivo maior pelo navegador, passe por fora da Cloudflare temporariamente:
+
+- **arquivo hosts** (recomendado): no seu computador, adicione `IP_DO_SERVIDOR  exemplo.com.br` ao
+  `/etc/hosts` (Windows: `C:\Windows\System32\drivers\etc\hosts`), faça o upload e remova a linha.
+  Como o certificado é Let's Encrypt, o HTTPS continua válido.
+- ou deixe o registro DNS como *DNS only* (nuvem cinza) durante a importação.
+- ou envie o arquivo por SFTP (ex: para `wp-content/ai1wm-backups/`) e restaure pelo painel do plugin.
 
 ## Envio de e-mail
 

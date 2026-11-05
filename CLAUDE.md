@@ -61,6 +61,10 @@ Dados do laboratório atual (IP, domínio de teste): ver `CLAUDE.local.md` (fora
 - IP real da Cloudflare: `/usr/local/sbin/update-cloudflare-ips` (cron semanal).
 - Personalização por site sem perder em `regen`: `/etc/nginx/sites-custom/<dominio>/*.conf`.
 
+**Uploads**
+- Limite único `UPLOAD_MAX` (MB, padrão 1024) aplicado a PHP (`upload_max_filesize`/`post_max_size`) e nginx (`client_max_body_size`). Pedido do usuário: 1 GB para All-in-One WP Migration.
+- A Cloudflare Free/Pro corta em 100 MB; para uploads maiores, contornar a CF (arquivo hosts, nuvem cinza ou SFTP). Documentado no README.
+
 **PHP**
 - Repositório packages.sury.org para várias versões lado a lado (`site php-install X`, `site php <dominio> X`). Padrão 8.4.
 - Configuração comum de PHP fica em `cmd_php_install` (o `setup.sh` chama `site php-install`, sem duplicar código).

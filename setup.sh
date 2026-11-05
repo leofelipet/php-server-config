@@ -15,6 +15,7 @@
 #     DEFAULT_PHP="8.4"           versão padrão para novos sites
 #     TIMEZONE="America/Sao_Paulo"
 #     SWAP_SIZE="2G"              "0" para não criar swap
+#     UPLOAD_MAX="1024"           limite de upload em MB (PHP + nginx)
 #     LE_EMAIL="voce@exemplo.com"  e-mail da conta Let's Encrypt (opcional)
 # =============================================================================
 set -euo pipefail
@@ -23,6 +24,7 @@ PHP_VERSIONS="${PHP_VERSIONS:-8.4}"
 DEFAULT_PHP="${DEFAULT_PHP:-8.4}"
 TIMEZONE="${TIMEZONE:-America/Sao_Paulo}"
 SWAP_SIZE="${SWAP_SIZE:-2G}"
+UPLOAD_MAX="${UPLOAD_MAX:-1024}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export DEBIAN_FRONTEND=noninteractive
@@ -131,7 +133,7 @@ EOF
 cat > /etc/nginx/conf.d/00-tuning.conf <<'EOF'
 # Gerenciado por setup.sh
 server_tokens off;
-client_max_body_size 128m;
+client_max_body_size __UPLOAD_MAX__m;
 client_body_timeout 60s;
 keepalive_timeout 30s;
 types_hash_max_size 4096;
@@ -158,6 +160,7 @@ fastcgi_buffer_size 32k;
 
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 EOF
+sed -i "s/__UPLOAD_MAX__/${UPLOAD_MAX}/" /etc/nginx/conf.d/00-tuning.conf
 
 # segurança comum a todos os sites
 cat > /etc/nginx/snippets/site-security.conf <<'EOF'
@@ -295,6 +298,7 @@ DEFAULT_PHP="$DEFAULT_PHP"
 WWW_ROOT="/srv/www"
 BACKUP_DIR="/var/backups/sites"
 TIMEZONE="$TIMEZONE"
+UPLOAD_MAX="$UPLOAD_MAX"
 EOF
 install -m 755 "$SCRIPT_DIR/bin/site" /usr/local/sbin/site
 ok "/usr/local/sbin/site instalado"

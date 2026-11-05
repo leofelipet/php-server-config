@@ -7,7 +7,7 @@ set -euo pipefail
 
 CONF=/etc/site/site.conf
 SITES_DIR=/etc/site/sites
-DEFAULT_PHP="8.4"; WWW_ROOT="/srv/www"; BACKUP_DIR="/var/backups/sites"; TIMEZONE="America/Sao_Paulo"
+UPLOAD_MAX="1024"; DEFAULT_PHP="8.4"; WWW_ROOT="/srv/www"; BACKUP_DIR="/var/backups/sites"; TIMEZONE="America/Sao_Paulo"
 [[ -f $CONF ]] && . "$CONF"
 
 # ---------------------------------------------------------------- utilidades
@@ -456,10 +456,10 @@ cmd_php_install() {
 ; Gerenciado por "site php-install"
 expose_php = Off
 memory_limit = 256M
-upload_max_filesize = 128M
-post_max_size = 128M
-max_execution_time = 120
-max_input_time = 120
+upload_max_filesize = ${UPLOAD_MAX}M
+post_max_size = ${UPLOAD_MAX}M
+max_execution_time = 300
+max_input_time = 300
 max_input_vars = 5000
 date.timezone = $TIMEZONE
 opcache.enable = 1
