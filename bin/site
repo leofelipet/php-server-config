@@ -567,7 +567,13 @@ acme_reachable() {
   local name=$1 tok; tok=$(genpass 32)
   install -d -m 755 /var/www/acme/.well-known/acme-challenge
   echo "$tok" > "/var/www/acme/.well-known/acme-challenge/$tok"
-  local got; got=$(curl -sLk --max-time 15 "http://$name/.well-known/acme-challenge/$tok" 2>/dev/null || true)
+  # várias tentativas: logo após "site create" o reload do nginx pode ainda não ter terminado
+  local got="" i
+  for i in 1 2 3 4 5; do
+    got=$(curl -sLk --max-time 15 "http://$name/.well-known/acme-challenge/$tok" 2>/dev/null || true)
+    [[ $got == "$tok" ]] && break
+    sleep 2
+  done
   rm -f "/var/www/acme/.well-known/acme-challenge/$tok"
   [[ $got == "$tok" ]]
 }
