@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  site — gerenciador de sites (Nginx + PHP-FPM + MariaDB) sem painel
+#  Instalado por setup.sh em /usr/local/sbin/site.  Execute "site help".
+# =============================================================================
+set -euo pipefail
+
+CONF=/etc/site/site.conf
+SITES_DIR=/etc/site/sites
+DEFAULT_PHP="8.4"; WWW_ROOT="/srv/www"; BACKUP_DIR="/var/backups/sites"; TIMEZONE="America/Sao_Paulo"
+[[ -f $CONF ]] && . "$CONF"
+
+# ---------------------------------------------------------------- utilidades
+c_b=$'\033[1m'; c_g=$'\033[32m'; c_r=$'\033[31m'; c_y=$'\033[33m'; c_0=$'\033[0m'
+log()  { printf '%s==>%s %s\n' "$c_b" "$c_0" "$*"; }
+ok()   { printf '%s ✔%s %s\n' "$c_g" "$c_0" "$*"; }
+warn() { printf '%s !%s %s\n' "$c_y" "$c_0" "$*" >&2; }
+die()  { printf '%sERRO:%s %s\n' "$c_r" "$c_0" "$*" >&2; exit 1; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "execute como root"; }
+genpass()   { local n=${1:-24}; tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$n" || true; }
+
+valid_domain() { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]; }
+valid_user()   { [[ $1 =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; }
+
+site_file()   { echo "$SITES_DIR/$1.env"; }
+site_exists() { [[ -f $(site_file "$1") ]]; }
+load_site() {
+  local d=$1
+  valid_domain "$d" || die "domínio inválido: $d"
+  site_exists "$d" || die "site não encontrado: $d (veja: site list)"
+  # shellcheck disable=SC1090
+  . "$(site_file "$d")"
+  SITE_DIR="$WWW_ROOT/$DOMAIN"
+}
+save_site() {
+  local f; f=$(site_file "$DOMAIN")
+  install -m 600 /dev/null "$f"
+  cat > "$f" <<EOF
+DOMAIN="$DOMAIN"
+TYPE="$TYPE"
+SITE_USER="$SITE_USER"
+PHP="$PHP"
+ALIASES="$ALIASES"
+DB_NAME="$DB_NAME"
+DB_USER="$DB_USER"
+DB_PASS="$DB_PASS"
+WP_ADMIN_USER="${WP_ADMIN_USER:-}"
+WP_ADMIN_PASS="${WP_ADMIN_PASS:-}"
+WP_ADMIN_EMAIL="${WP_ADMIN_EMAIL:-}"
+CREATED="${CREATED:-$(date -Is)}"
+EOF
+}
+
+# deriva um nome de usuário Linux a partir do domínio
+user_from_domain() {
+  local s=${1#www.}
+  s=$(sed -E 's/\.(com|net|org|gov|edu|art|blog|app)\.br$//; s/\.(com|net|org|br|io|dev|app|info|me|co)$//' <<<"$s")
+  s=$(tr -cd 'a-z0-9' <<<"$s")
+  [[ $s =~ ^[a-z] ]] || s="s$s"
+  echo "${s:0:24}"
+}
+
+webroot_of() { if [[ $TYPE == laravel ]]; then echo "$SITE_DIR/htdocs/public"; else echo "$SITE_DIR/htdocs"; fi; }
+sock_of()    { echo "/run/php/site-$SITE_USER.sock"; }
+
+# umask 0007: arquivos legíveis/editáveis pelo grupo do site (nginx + usuários SFTP)
+as_site() { ( umask 0007; runuser -u "$SITE_USER" -- env HOME="/home/$SITE_USER" "$@" ); }
+
+php_installed() { [[ -x /usr/sbin/php-fpm$1 ]]; }
+
+sql() { mariadb --batch --skip-column-names -e "$1"; }
+
+wait_socket() { local i; for i in $(seq 1 50); do [[ -S $(sock_of) ]] && return 0; sleep 0.1; done; warn "socket $(sock_of) ainda não apareceu"; }
+
+reload_nginx() { nginx -t -q 2>/dev/null || { nginx -t; die "configuração do nginx inválida"; }; systemctl reload nginx; }
+
+# ---------------------------------------------------------------- templates
+write_pool() {
+  local v=$1
+  cat > "/etc/php/$v/fpm/pool.d/$DOMAIN.conf" <<EOF
+; Gerenciado por "site" — $DOMAIN
+[$DOMAIN]
+user  = $SITE_USER
+group = $SITE_USER
+listen = $(sock_of)
+listen.owner = www-data
+listen.group = www-data
+listen.mode  = 0660
+
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 30s
+pm.max_requests = 500
+request_terminate_timeout = 300s
+
+chdir = /
+security.limit_extensions = .php
+catch_workers_output = yes
+
+php_admin_value[error_log]          = $SITE_DIR/logs/php-error.log
+php_admin_flag[log_errors]          = on
+php_admin_value[upload_tmp_dir]     = $SITE_DIR/tmp
+php_admin_value[sys_temp_dir]       = $SITE_DIR/tmp
+php_admin_value[session.save_path]  = $SITE_DIR/tmp/sessions
+EOF
+}
+
+write_vhost() {
+  local names="$DOMAIN${ALIASES:+ $ALIASES}" snippet
+  case $TYPE in wordpress) snippet=wordpress ;; laravel) snippet=laravel ;; *) snippet=generic ;; esac
+  install -d -m 755 "/etc/nginx/sites-custom/$DOMAIN"
+  cat > "/etc/nginx/sites-available/$DOMAIN.conf" <<EOF
+# Gerenciado por "site" — NÃO edite; personalizações em /etc/nginx/sites-custom/$DOMAIN/*.conf
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $names;
+    location ^~ /.well-known/acme-challenge/ { root /var/www/acme; default_type text/plain; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name $names;
+
+    ssl_certificate     /etc/ssl/sites/$DOMAIN.crt;
+    ssl_certificate_key /etc/ssl/sites/private/$DOMAIN.key;
+
+    root  $(webroot_of);
+    index index.php index.html;
+
+    access_log $SITE_DIR/logs/access.log;
+    error_log  $SITE_DIR/logs/error.log;
+
+    location ^~ /.well-known/acme-challenge/ { root /var/www/acme; default_type text/plain; }
+    include /etc/nginx/sites-custom/$DOMAIN/*.conf;
+    include snippets/site-security.conf;
+    include snippets/$snippet.conf;
+
+    location ~ \.php\$ {
+        include snippets/php-site.conf;
+        fastcgi_pass unix:$(sock_of);
+    }
+}
+EOF
+  ln -sf "/etc/nginx/sites-available/$DOMAIN.conf" "/etc/nginx/sites-enabled/$DOMAIN.conf"
+}
+
+self_signed_cert() {
+  local san="DNS:$DOMAIN" a
+  for a in $ALIASES; do san+=",DNS:$a"; done
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 -subj "/CN=$DOMAIN" \
+    -addext "subjectAltName=$san" \
+    -keyout "/etc/ssl/sites/private/$DOMAIN.key" -out "/etc/ssl/sites/$DOMAIN.crt" 2>/dev/null
+  chmod 600 "/etc/ssl/sites/private/$DOMAIN.key"
+}
+
+placeholder_page() {
+  cat <<EOF
+<!doctype html><html lang="pt-br"><meta charset="utf-8"><title>$DOMAIN</title>
+<body style="font-family:sans-serif;max-width:40rem;margin:4rem auto">
+<h1>$DOMAIN</h1><p>Site criado. Envie os arquivos via SFTP ou git.</p>
+<p><small>PHP <?php echo PHP_VERSION; ?></small></p></body></html>
+EOF
+}
+
+# ---------------------------------------------------------------- comandos
+cmd_help() {
+  cat <<EOF
+${c_b}site${c_0} — gerenciador de sites sem painel
+
+${c_b}Sites${c_0}
+  site create <dominio> [--wordpress|--laravel|--php] [opções]
+        --php-version X     versão PHP (padrão $DEFAULT_PHP)
+        --alias "a b"       nomes adicionais (ex: "www.exemplo.com.br")
+        --user nome         usuário Linux (padrão: derivado do domínio)
+        --git URL           (laravel/php) clona o repositório em htdocs/
+        --no-db             não cria banco de dados
+        --no-ssl            não tenta emitir Let's Encrypt agora
+      WordPress:
+        --title "Título"    --admin-user U   --admin-email E   --locale pt_BR
+  site list
+  site info <dominio>
+  site delete <dominio> [--yes] [--no-backup]
+  site php <dominio> <versão>          troca a versão PHP do site
+  site php-install <versão>            instala uma versão PHP (ex: 8.3)
+
+${c_b}Acesso SFTP (FileZilla)${c_0}
+  site sftp-add <dominio> <usuario> [--key "ssh-ed25519 ..." | --key-file arq] [--no-password]
+  site sftp-list <dominio>
+  site sftp-passwd <dominio> <usuario>
+  site sftp-del <dominio> <usuario>
+
+${c_b}SSL${c_0}
+  site ssl <dominio>                                        emite/reemite Let's Encrypt (renovação automática)
+  site ssl <dominio> --cert arquivo.pem --key arquivo.key   instala certificado próprio
+  site ssl-info <dominio>
+
+${c_b}Manutenção${c_0}
+  site run <dominio> -- <comando>      executa comando como usuário do site (em htdocs/)
+  site wp <dominio> <args>             WP-CLI   (ex: site wp ex.com.br plugin list)
+  site shell <dominio>                 shell como usuário do site
+  site git-key <dominio>               gera/mostra chave SSH de deploy (GitHub/GitLab)
+  site fix-perms <dominio>             corrige dono/permissões dos arquivos
+  site regen <dominio>|--all           reescreve vhost nginx e pool PHP a partir dos templates
+  site db-import <dominio> <arq.sql[.gz|.zst]>
+  site db-export <dominio> [arquivo]
+  site backup <dominio>|--all [--keep N]
+EOF
+}
+
+cmd_create() {
+  need_root
+  local d=${1:-}; shift || true
+  [[ -n $d ]] || die "uso: site create <dominio> [--wordpress|--laravel|--php]"
+  d=${d,,}
+  valid_domain "$d" || die "domínio inválido: $d"
+  site_exists "$d" && die "site já existe: $d"
+
+  TYPE=php; PHP=$DEFAULT_PHP; ALIASES=""; SITE_USER=""; local git_url="" with_db=1 with_ssl=1
+  local title="" locale="pt_BR"; WP_ADMIN_USER="admin"; WP_ADMIN_EMAIL=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --wordpress|--wp) TYPE=wordpress ;;
+      --laravel)        TYPE=laravel ;;
+      --php)            TYPE=php ;;
+      --php-version)    PHP=$2; shift ;;
+      --alias|--aliases) ALIASES=$2; shift ;;
+      --user)           SITE_USER=$2; shift ;;
+      --git)            git_url=$2; shift ;;
+      --no-db)          with_db=0 ;;
+      --no-ssl)         with_ssl=0 ;;
+      --title)          title=$2; shift ;;
+      --admin-user)     WP_ADMIN_USER=$2; shift ;;
+      --admin-email)    WP_ADMIN_EMAIL=$2; shift ;;
+      --locale)         locale=$2; shift ;;
+      *) die "opção desconhecida: $1" ;;
+    esac
+    shift
+  done
+  [[ $TYPE == wordpress ]] && with_db=1
+  [[ $TYPE == wordpress && -n $git_url ]] && die "--git não se aplica a --wordpress"
+  for a in $ALIASES; do valid_domain "$a" || die "alias inválido: $a"; done
+  php_installed "$PHP" || die "PHP $PHP não instalado (use: site php-install $PHP)"
+
+  DOMAIN=$d
+  SITE_USER=${SITE_USER:-$(user_from_domain "$d")}
+  valid_user "$SITE_USER" || die "usuário inválido: $SITE_USER (use --user)"
+  id "$SITE_USER" &>/dev/null && die "usuário Linux '$SITE_USER' já existe (use --user outro_nome)"
+  SITE_DIR="$WWW_ROOT/$DOMAIN"
+  [[ -e $SITE_DIR ]] && die "$SITE_DIR já existe"
+  DB_NAME=""; DB_USER=""; DB_PASS=""; WP_ADMIN_PASS=""
+  if (( with_db )); then
+    DB_NAME=$SITE_USER; DB_USER=$SITE_USER; DB_PASS=$(genpass 28)
+    [[ -n $(sql "SHOW DATABASES LIKE '$DB_NAME'") ]] && die "banco '$DB_NAME' já existe"
+  fi
+
+  log "Criando $DOMAIN ($TYPE, PHP $PHP, usuário $SITE_USER)"
+
+  # usuário e diretórios
+  useradd --create-home --home-dir "/home/$SITE_USER" --shell /bin/bash --user-group "$SITE_USER"
+  chmod 750 "/home/$SITE_USER"
+  usermod -aG "$SITE_USER" www-data
+  install -d -o root -g root -m 755 "$SITE_DIR"              # raiz do chroot SFTP (precisa ser do root)
+  install -d -o "$SITE_USER" -g "$SITE_USER" -m 2770 "$SITE_DIR/htdocs"
+  install -d -o root -g "$SITE_USER" -m 2770 "$SITE_DIR/logs"
+  install -d -o "$SITE_USER" -g "$SITE_USER" -m 2770 "$SITE_DIR/tmp" "$SITE_DIR/tmp/sessions"
+  ok "usuário e diretórios"
+
+  # banco de dados
+  if (( with_db )); then
+    sql "CREATE DATABASE \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+         CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+         CREATE USER '$DB_USER'@'127.0.0.1' IDENTIFIED BY '$DB_PASS';
+         GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost';
+         GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'127.0.0.1';
+         FLUSH PRIVILEGES;"
+    ok "banco $DB_NAME"
+  fi
+
+  save_site
+
+  # código
+  case $TYPE in
+    wordpress)
+      WP_ADMIN_EMAIL=${WP_ADMIN_EMAIL:-admin@$DOMAIN}
+      WP_ADMIN_PASS=$(genpass 20)
+      ( cd "$SITE_DIR/htdocs"
+        # baixa o .zip oficial (o "wp core download" usa .tar.gz e trunca nomes longos)
+        local url
+        url=$(curl -fsS "https://api.wordpress.org/core/version-check/1.7/?locale=$locale" | jq -r '.offers[0].download')
+        [[ $url == https://downloads.wordpress.org/* ]] || die "não foi possível obter a URL do WordPress ($locale)"
+        as_site curl -fsSLo "$SITE_DIR/tmp/wordpress.zip" "$url"
+        as_site unzip -q "$SITE_DIR/tmp/wordpress.zip" -d "$SITE_DIR/tmp/wp-extract"
+        as_site cp -a "$SITE_DIR/tmp/wp-extract/wordpress/." "$SITE_DIR/htdocs/"
+        rm -rf "$SITE_DIR/tmp/wordpress.zip" "$SITE_DIR/tmp/wp-extract"
+        as_site wp core verify-checksums --quiet || die "checksums do WordPress não conferem"
+        as_site wp config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" \
+          --dbhost=localhost --dbcharset=utf8mb4 --locale="$locale" --quiet \
+          --extra-php <<'PHP'
+define( 'FS_METHOD', 'direct' );
+define( 'WP_AUTO_UPDATE_CORE', 'minor' );
+PHP
+        as_site wp core install --url="https://$DOMAIN" --title="${title:-$DOMAIN}" \
+          --admin_user="$WP_ADMIN_USER" --admin_password="$WP_ADMIN_PASS" \
+          --admin_email="$WP_ADMIN_EMAIL" --skip-email --quiet
+        as_site wp option update timezone_string "$TIMEZONE" --quiet
+        as_site wp rewrite structure '/%postname%/' --quiet
+        as_site wp plugin delete hello akismet --quiet 2>/dev/null || true
+      )
+      save_site
+      ok "WordPress instalado"
+      ;;
+    laravel|php)
+      if [[ -n $git_url ]]; then
+        ( cd "$SITE_DIR/htdocs" && as_site git clone --quiet "$git_url" . ) || die "falha ao clonar $git_url"
+        ok "repositório clonado"
+      else
+        local w; w=$(webroot_of)
+        install -d -o "$SITE_USER" -g "$SITE_USER" -m 2770 "$w"
+        placeholder_page | install -o "$SITE_USER" -g "$SITE_USER" -m 660 /dev/stdin "$w/index.php"
+      fi
+      ;;
+  esac
+
+  # PHP-FPM, SSL, nginx
+  write_pool "$PHP"
+  systemctl reload "php$PHP-fpm"
+  wait_socket
+  self_signed_cert
+  write_vhost
+  reload_nginx
+  ok "PHP-FPM e nginx"
+  if (( with_ssl )); then
+    letsencrypt_issue || warn "SSL: mantido certificado provisório. Quando o DNS estiver apontado rode: site ssl $DOMAIN"
+  fi
+
+  echo
+  log "Site criado: https://$DOMAIN"
+  cat <<EOF
+  Diretório  : $SITE_DIR/htdocs   (web root: $(webroot_of))
+  Usuário    : $SITE_USER
+  PHP        : $PHP
+EOF
+  if (( with_db )); then cat <<EOF
+  Banco      : $DB_NAME   usuário: $DB_USER   senha: $DB_PASS   host: localhost
+EOF
+  fi
+  if [[ $TYPE == wordpress ]]; then cat <<EOF
+  WP admin   : https://$DOMAIN/wp-admin   usuário: $WP_ADMIN_USER   senha: $WP_ADMIN_PASS
+EOF
+  fi
+  cat <<EOF
+
+  Próximos passos:
+    site sftp-add $DOMAIN <usuario>                       # acesso FileZilla
+    site ssl $DOMAIN                                      # (re)emite Let's Encrypt
+  (credenciais guardadas em $(site_file "$DOMAIN") — veja com: site info $DOMAIN)
+EOF
+}
+
+cmd_list() {
+  need_root
+  printf '%-40s %-10s %-5s %-24s\n' DOMÍNIO TIPO PHP USUÁRIO
+  local f
+  for f in "$SITES_DIR"/*.env; do
+    [[ -e $f ]] || continue
+    ( . "$f"; printf '%-40s %-10s %-5s %-24s\n' "$DOMAIN" "$TYPE" "$PHP" "$SITE_USER" )
+  done
+}
+
+cmd_info() {
+  need_root; load_site "${1:-}"
+  cat <<EOF
+Domínio    : $DOMAIN ${ALIASES:+(aliases: $ALIASES)}
+Tipo       : $TYPE
+PHP        : $PHP   (socket $(sock_of))
+Usuário    : $SITE_USER
+Diretório  : $SITE_DIR/htdocs   (web root: $(webroot_of))
+Logs       : $SITE_DIR/logs/
+Criado em  : $CREATED
+EOF
+  [[ -n $DB_NAME ]] && echo "Banco      : $DB_NAME   usuário: $DB_USER   senha: $DB_PASS   host: localhost"
+  [[ -n ${WP_ADMIN_USER:-} && $TYPE == wordpress ]] && echo "WP admin   : $WP_ADMIN_USER / $WP_ADMIN_PASS  (senha inicial)"
+  echo "SFTP       : $(sftp_users | xargs echo)"
+  echo -n "SSL        : "; ssl_summary
+}
+
+sftp_users() {
+  local gid; gid=$(getent group "$SITE_USER" | cut -d: -f3)
+  awk -F: -v g="$gid" -v o="$SITE_USER" '$4==g && $1!=o {print $1}' /etc/passwd
+}
+
+cmd_delete() {
+  need_root
+  local d=${1:-} yes=0 backup=1; shift || true
+  while [[ $# -gt 0 ]]; do case $1 in --yes) yes=1 ;; --no-backup) backup=0 ;; *) die "opção desconhecida: $1" ;; esac; shift; done
+  load_site "$d"
+  if (( ! yes )); then
+    read -r -p "Remover DEFINITIVAMENTE $DOMAIN (arquivos, banco, usuários)? Digite o domínio para confirmar: " ans
+    [[ $ans == "$DOMAIN" ]] || die "cancelado"
+  fi
+  (( backup )) && cmd_backup "$DOMAIN" --keep 0
+  local u
+  for u in $(sftp_users); do userdel "$u"; rm -f "/etc/ssh/authorized_keys/$u"; done
+  rm -f "/etc/nginx/sites-enabled/$DOMAIN.conf" "/etc/nginx/sites-available/$DOMAIN.conf"
+  rm -rf "/etc/nginx/sites-custom/$DOMAIN"
+  rm -f "/etc/ssl/sites/$DOMAIN.crt" "/etc/ssl/sites/private/$DOMAIN.key"
+  [[ -d /etc/letsencrypt/live/$DOMAIN ]] && certbot delete --cert-name "$DOMAIN" --non-interactive >/dev/null 2>&1 || true
+  reload_nginx
+  rm -f "/etc/php/$PHP/fpm/pool.d/$DOMAIN.conf"
+  systemctl reload "php$PHP-fpm"
+  if [[ -n $DB_NAME ]]; then
+    sql "DROP DATABASE IF EXISTS \`$DB_NAME\`; DROP USER IF EXISTS '$DB_USER'@'localhost'; DROP USER IF EXISTS '$DB_USER'@'127.0.0.1';"
+  fi
+  crontab -r -u "$SITE_USER" 2>/dev/null || true
+  pkill -u "$SITE_USER" 2>/dev/null || true
+  gpasswd -d www-data "$SITE_USER" >/dev/null 2>&1 || true
+  userdel -r "$SITE_USER" 2>/dev/null || userdel "$SITE_USER"
+  rm -rf "$SITE_DIR"
+  rm -f "$(site_file "$DOMAIN")"
+  if (( backup )); then ok "site $DOMAIN removido (backup final em $BACKUP_DIR/$DOMAIN/)"; else ok "site $DOMAIN removido"; fi
+}
+
+cmd_php() {
+  need_root
+  load_site "${1:-}"; local v=${2:-}
+  [[ -n $v ]] || die "uso: site php <dominio> <versão>"
+  php_installed "$v" || die "PHP $v não instalado (use: site php-install $v)"
+  [[ $v == "$PHP" ]] && { ok "já está em PHP $v"; return; }
+  local old=$PHP
+  write_pool "$v"
+  rm -f "/etc/php/$old/fpm/pool.d/$DOMAIN.conf"
+  systemctl reload "php$old-fpm"
+  sleep 1
+  systemctl reload "php$v-fpm"
+  wait_socket
+  PHP=$v; save_site
+  ok "$DOMAIN agora usa PHP $v"
+}
+
+cmd_php_install() {
+  need_root
+  local v=${1:-}; [[ $v =~ ^[5-9]\.[0-9]$ ]] || die "uso: site php-install <versão>  (ex: 8.3)"
+  local pkgs=() ext
+  for ext in fpm cli common mysql curl gd intl mbstring xml zip bcmath soap imagick redis opcache readline; do
+    apt-cache show "php$v-$ext" >/dev/null 2>&1 && pkgs+=("php$v-$ext")
+  done
+  [[ ${#pkgs[@]} -gt 0 ]] || die "pacotes do PHP $v não encontrados"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${pkgs[@]}"
+
+  cat > "/etc/php/$v/fpm/conf.d/99-site-defaults.ini" <<EOF
+; Gerenciado por "site php-install"
+expose_php = Off
+memory_limit = 256M
+upload_max_filesize = 128M
+post_max_size = 128M
+max_execution_time = 120
+max_input_time = 120
+max_input_vars = 5000
+date.timezone = $TIMEZONE
+opcache.enable = 1
+opcache.memory_consumption = 256
+opcache.interned_strings_buffer = 16
+opcache.max_accelerated_files = 20000
+opcache.validate_timestamps = 1
+opcache.revalidate_freq = 2
+EOF
+  cat > "/etc/php/$v/cli/conf.d/99-site-defaults.ini" <<EOF
+; Gerenciado por "site php-install"
+memory_limit = 512M
+date.timezone = $TIMEZONE
+EOF
+  # pool "www" padrão reduzido ao mínimo (FPM exige ao menos um pool)
+  sed -i -e 's/^pm = .*/pm = ondemand/' -e 's/^pm.max_children = .*/pm.max_children = 2/' \
+    "/etc/php/$v/fpm/pool.d/www.conf"
+  # umask 0007: arquivos criados pelo PHP ficam editáveis pelo grupo do site (SFTP)
+  install -d "/etc/systemd/system/php$v-fpm.service.d"
+  printf '[Service]\nUMask=0007\n' > "/etc/systemd/system/php$v-fpm.service.d/override.conf"
+  systemctl daemon-reload
+  systemctl enable -q "php$v-fpm"
+  systemctl restart "php$v-fpm"
+  ok "PHP $v instalado ($(php$v -r 'echo PHP_VERSION;'))"
+}
+
+# ---------------------------------------------------------------- SFTP
+cmd_sftp_add() {
+  need_root
+  load_site "${1:-}"; local u=${2:-}; shift 2 || true
+  [[ -n $u ]] || die "uso: site sftp-add <dominio> <usuario> [--key \"...\"|--key-file arq] [--no-password]"
+  local key="" pw=1
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --key) key=$2; shift ;;
+      --key-file) [[ -f $2 ]] || die "arquivo não encontrado: $2"; key=$(cat "$2"); shift ;;
+      --no-password) pw=0 ;;
+      *) die "opção desconhecida: $1" ;;
+    esac; shift
+  done
+  valid_user "$u" || die "nome de usuário inválido: $u"
+  id "$u" &>/dev/null && die "usuário '$u' já existe"
+  (( pw == 0 )) && [[ -z $key ]] && die "--no-password exige --key"
+  if [[ -n $key ]]; then
+    ssh-keygen -l -f /dev/stdin <<<"$key" >/dev/null 2>&1 || die "chave SSH pública inválida"
+  fi
+
+  useradd --no-create-home --home-dir "$SITE_DIR" --shell /usr/sbin/nologin \
+          --gid "$SITE_USER" --groups sftponly "$u"
+  local pass=""
+  if (( pw )); then pass=$(genpass 20); echo "$u:$pass" | chpasswd; fi
+  if [[ -n $key ]]; then
+    printf '%s\n' "$key" > "/etc/ssh/authorized_keys/$u"
+    chmod 644 "/etc/ssh/authorized_keys/$u"
+  fi
+  ok "usuário SFTP $u criado para $DOMAIN"
+  cat <<EOF
+
+  FileZilla → Protocolo: SFTP - SSH File Transfer Protocol
+  Host     : $(hostname -I | awk '{print $1}')   (ou o IP/hostname do servidor — não use o domínio se estiver atrás da Cloudflare)
+  Porta    : 22
+  Usuário  : $u
+EOF
+  (( pw )) && echo "  Senha    : $pass"
+  [[ -n $key ]] && echo "  Chave    : autorizada ($(ssh-keygen -l -f "/etc/ssh/authorized_keys/$u" | awk '{print $2}'))"
+  echo "  Pasta    : /htdocs  (arquivos do site)   /logs  (logs)"
+}
+
+sftp_check_user() {
+  local u=$1
+  id "$u" &>/dev/null || die "usuário '$u' não existe"
+  [[ $(id -gn "$u") == "$SITE_USER" ]] && id -nG "$u" | grep -qw sftponly || die "'$u' não é usuário SFTP de $DOMAIN"
+}
+
+cmd_sftp_list()   { need_root; load_site "${1:-}"; sftp_users; }
+cmd_sftp_passwd() {
+  need_root; load_site "${1:-}"; local u=${2:-}; sftp_check_user "$u"
+  local pass; pass=$(genpass 20); echo "$u:$pass" | chpasswd
+  ok "nova senha de $u: $pass"
+}
+cmd_sftp_del() {
+  need_root; load_site "${1:-}"; local u=${2:-}; sftp_check_user "$u"
+  pkill -u "$u" 2>/dev/null || true
+  userdel "$u"; rm -f "/etc/ssh/authorized_keys/$u"
+  ok "usuário SFTP $u removido"
+}
+
+# ---------------------------------------------------------------- SSL
+ssl_summary() {
+  local c="/etc/ssl/sites/$DOMAIN.crt"
+  [[ -f $c ]] || { echo "nenhum"; return; }
+  local issuer end
+  issuer=$(openssl x509 -in "$c" -noout -issuer | sed 's/^issuer=//')
+  end=$(openssl x509 -in "$c" -noout -enddate | cut -d= -f2)
+  echo "$issuer — válido até $end"
+}
+cmd_ssl_info() {
+  need_root; load_site "${1:-}"; ssl_summary
+  [[ -d /etc/letsencrypt/live/$DOMAIN ]] && certbot certificates --cert-name "$DOMAIN" 2>/dev/null | grep -E "Domains|Expiry" | sed 's/^ */  /'
+  return 0
+}
+
+# verifica se http://<nome>/.well-known/acme-challenge/ chega neste servidor (via DNS público / Cloudflare)
+acme_reachable() {
+  local name=$1 tok; tok=$(genpass 32)
+  install -d -m 755 /var/www/acme/.well-known/acme-challenge
+  echo "$tok" > "/var/www/acme/.well-known/acme-challenge/$tok"
+  local got; got=$(curl -sLk --max-time 15 "http://$name/.well-known/acme-challenge/$tok" 2>/dev/null || true)
+  rm -f "/var/www/acme/.well-known/acme-challenge/$tok"
+  [[ $got == "$tok" ]]
+}
+
+letsencrypt_issue() {
+  local names=() n args=()
+  for n in $DOMAIN $ALIASES; do
+    if acme_reachable "$n"; then names+=("$n")
+    else warn "SSL: $n não aponta para este servidor (DNS) — ignorado"; fi
+  done
+  [[ ${#names[@]} -gt 0 && ${names[0]} == "$DOMAIN" ]] || return 1
+  for n in "${names[@]}"; do args+=(-d "$n"); done
+  log "Let's Encrypt: ${names[*]}"
+  certbot certonly --webroot -w /var/www/acme --cert-name "$DOMAIN" "${args[@]}" \
+    --non-interactive --agree-tos --keep-until-expiring --expand --quiet || { warn "certbot falhou (veja /var/log/letsencrypt/letsencrypt.log)"; return 1; }
+  ln -sfn "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "/etc/ssl/sites/$DOMAIN.crt"
+  ln -sfn "/etc/letsencrypt/live/$DOMAIN/privkey.pem"   "/etc/ssl/sites/private/$DOMAIN.key"
+  reload_nginx
+  ok "SSL Let's Encrypt ativo: $(ssl_summary)"
+}
+
+cmd_ssl() {
+  need_root
+  load_site "${1:-}"; shift || true
+  local cert="" key=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in --cert) cert=$2; shift ;; --key) key=$2; shift ;; *) die "opção desconhecida: $1" ;; esac; shift
+  done
+  if [[ -z $cert && -z $key ]]; then
+    letsencrypt_issue || die "não foi possível emitir o certificado para $DOMAIN"
+    return
+  fi
+  [[ -f $cert && -f $key ]] || die "uso: site ssl <dominio> [--cert arquivo.pem --key arquivo.key]"
+  openssl x509 -in "$cert" -noout 2>/dev/null || die "certificado inválido: $cert"
+  openssl pkey -in "$key" -noout 2>/dev/null  || die "chave privada inválida: $key"
+  [[ $(openssl x509 -in "$cert" -noout -pubkey | sha256sum) == $(openssl pkey -in "$key" -pubout | sha256sum) ]] \
+    || die "a chave privada não corresponde ao certificado"
+  local n; for n in $DOMAIN $ALIASES; do
+    openssl x509 -in "$cert" -noout -checkhost "$n" | grep -q 'does match' || warn "certificado não cobre $n"
+  done
+  local crt=/etc/ssl/sites/$DOMAIN.crt k=/etc/ssl/sites/private/$DOMAIN.key
+  cp -a "$crt" "$crt.bak"; cp -a "$k" "$k.bak"
+  rm -f "$crt" "$k"
+  install -m 644 "$cert" "$crt"
+  install -m 600 "$key" "$k"
+  if nginx -t -q 2>/dev/null; then
+    systemctl reload nginx; rm -f "$crt.bak" "$k.bak"
+    ok "certificado instalado: $(ssl_summary)"
+  else
+    mv "$crt.bak" "$crt"; mv "$k.bak" "$k"
+    die "nginx rejeitou o certificado — revertido"
+  fi
+}
+
+# ---------------------------------------------------------------- manutenção
+cmd_run() {
+  need_root; load_site "${1:-}"; shift || true
+  [[ ${1:-} == -- ]] && shift
+  [[ $# -gt 0 ]] || die "uso: site run <dominio> -- <comando>"
+  cd "$SITE_DIR/htdocs" && as_site "$@"
+}
+cmd_wp() {
+  need_root; load_site "${1:-}"; shift || true
+  cd "$SITE_DIR/htdocs" && as_site wp "$@"
+}
+cmd_shell() {
+  need_root; load_site "${1:-}"
+  cd "$SITE_DIR/htdocs" && umask 0007 && exec runuser -u "$SITE_USER" -- env HOME="/home/$SITE_USER" bash -l
+}
+
+cmd_git_key() {
+  need_root; load_site "${1:-}"
+  local k="/home/$SITE_USER/.ssh/id_ed25519"
+  if [[ ! -f $k ]]; then
+    as_site install -d -m 700 "/home/$SITE_USER/.ssh"
+    as_site ssh-keygen -q -t ed25519 -N "" -C "$SITE_USER@$(hostname)" -f "$k"
+    ssh-keyscan -t ed25519,rsa github.com gitlab.com bitbucket.org 2>/dev/null | as_site tee -a "/home/$SITE_USER/.ssh/known_hosts" >/dev/null
+  fi
+  echo "Chave pública de deploy de $DOMAIN (adicione em GitHub → Settings → Deploy keys):"
+  echo
+  cat "$k.pub"
+  echo
+  echo "Depois:  site run $DOMAIN -- git clone git@github.com:org/repo.git ."
+}
+
+cmd_regen() {
+  need_root
+  local d=${1:-}
+  if [[ $d == --all ]]; then
+    local f; for f in "$SITES_DIR"/*.env; do [[ -e $f ]] && "$0" regen "$(basename "$f" .env)"; done; return
+  fi
+  load_site "$d"
+  write_vhost; write_pool "$PHP"
+  systemctl reload "php$PHP-fpm"; reload_nginx
+  ok "configuração de $DOMAIN regerada"
+}
+
+cmd_fix_perms() {
+  need_root; load_site "${1:-}"
+  chown root:root "$SITE_DIR"; chmod 755 "$SITE_DIR"
+  chown -R "$SITE_USER:$SITE_USER" "$SITE_DIR/htdocs" "$SITE_DIR/tmp"
+  chmod -R u=rwX,g=rwX,o= "$SITE_DIR/htdocs" "$SITE_DIR/tmp"
+  find "$SITE_DIR/htdocs" "$SITE_DIR/tmp" -type d -exec chmod g+s {} +
+  chown root:"$SITE_USER" "$SITE_DIR/logs"; chmod 2770 "$SITE_DIR/logs"
+  ok "permissões corrigidas em $SITE_DIR"
+}
+
+cmd_db_import() {
+  need_root; load_site "${1:-}"; local f=${2:-}
+  [[ -n $DB_NAME ]] || die "site sem banco de dados"
+  [[ -f $f ]] || die "uso: site db-import <dominio> <arquivo.sql|.sql.gz|.sql.zst>"
+  log "importando $f em $DB_NAME"
+  local cat=cat
+  case $f in *.gz) cat="zcat" ;; *.zst) cat="zstdcat" ;; esac
+  # remove DEFINER (evita erro de privilégio) e trata collations do MySQL 8
+  $cat "$f" | sed -E 's/DEFINER=`[^`]+`@`[^`]+`//g' | mariadb "$DB_NAME"
+  ok "importado ($(sql "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$DB_NAME'") tabelas)"
+}
+
+cmd_db_export() {
+  need_root; load_site "${1:-}"
+  [[ -n $DB_NAME ]] || die "site sem banco de dados"
+  local f=${2:-./$DB_NAME-$(date +%Y%m%d-%H%M%S).sql.zst}
+  mariadb-dump --single-transaction --quick --routines --triggers --events "$DB_NAME" | zstd -q -o "$f"
+  ok "banco exportado para $f"
+}
+
+cmd_backup() {
+  need_root
+  local target=${1:-} keep=7; shift || true
+  while [[ $# -gt 0 ]]; do case $1 in --keep) keep=$2; shift ;; *) die "opção desconhecida: $1" ;; esac; shift; done
+  if [[ $target == --all ]]; then
+    local f; for f in "$SITES_DIR"/*.env; do [[ -e $f ]] || continue
+      ( . "$f"; "$0" backup "$DOMAIN" --keep "$keep" ) || warn "falha no backup de $(basename "$f" .env)"
+    done; return
+  fi
+  load_site "$target"
+  umask 077
+  umask 077
+  local dest="$BACKUP_DIR/$DOMAIN" ts; ts=$(date +%Y%m%d-%H%M%S)
+  install -d -m 700 "$dest"
+  tar -C "$SITE_DIR" -cf - htdocs | zstd -q -T0 -o "$dest/$ts-files.tar.zst"
+  if [[ -n $DB_NAME ]]; then
+    mariadb-dump --single-transaction --quick --routines --triggers --events "$DB_NAME" | zstd -q -o "$dest/$ts-db.sql.zst"
+  fi
+  cp "$(site_file "$DOMAIN")" "$dest/$ts-site.env"; chmod 600 "$dest/$ts-site.env"
+  if (( keep > 0 )); then
+    ls -1t "$dest"/*-files.tar.zst 2>/dev/null | tail -n +$((keep + 1)) | while read -r old; do
+      rm -f "$old" "${old%-files.tar.zst}-db.sql.zst" "${old%-files.tar.zst}-site.env"
+    done
+  fi
+  ok "backup $DOMAIN → $dest/$ts-*"
+}
+
+# ---------------------------------------------------------------- main
+cmd=${1:-help}; shift || true
+case $cmd in
+  create)       cmd_create "$@" ;;
+  list|ls)      cmd_list ;;
+  info)         cmd_info "$@" ;;
+  delete|rm)    cmd_delete "$@" ;;
+  php)          cmd_php "$@" ;;
+  php-install)  cmd_php_install "$@" ;;
+  sftp-add)     cmd_sftp_add "$@" ;;
+  sftp-list)    cmd_sftp_list "$@" ;;
+  sftp-passwd)  cmd_sftp_passwd "$@" ;;
+  sftp-del|sftp-remove) cmd_sftp_del "$@" ;;
+  ssl)          cmd_ssl "$@" ;;
+  ssl-info)     cmd_ssl_info "$@" ;;
+  run)          cmd_run "$@" ;;
+  wp)           cmd_wp "$@" ;;
+  shell)        cmd_shell "$@" ;;
+  git-key)      cmd_git_key "$@" ;;
+  fix-perms)    cmd_fix_perms "$@" ;;
+  regen)        cmd_regen "$@" ;;
+  db-import)    cmd_db_import "$@" ;;
+  db-export)    cmd_db_export "$@" ;;
+  backup)       cmd_backup "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) die "comando desconhecido: $cmd (veja: site help)" ;;
+esac
